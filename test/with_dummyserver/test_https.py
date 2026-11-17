@@ -263,6 +263,29 @@ class BaseTestHTTPS(HTTPSHypercornDummyServerTestCase):
                 assert r.status == 200
                 assert not warn.called, warn.call_args_list
 
+    def test_shared_context_parallel_tls_handshakes(self) -> None:
+        # Each thread may create a fresh connection with one shared SSLContext.
+        # The library must finish TLS setup before any of them wraps a socket.
+        ctx = util.ssl_.create_urllib3_context(
+            cert_reqs=ssl.CERT_REQUIRED, ssl_minimum_version=self.tls_version()
+        )
+        with HTTPSConnectionPool(
+            self.host,
+            self.port,
+            ssl_context=ctx,
+            ca_certs=DEFAULT_CA,
+            maxsize=12,
+            block=True,
+        ) as https_pool:
+            barrier = threading.Barrier(12)
+
+            def get_status(_: int) -> int:
+                barrier.wait(timeout=5)
+                return https_pool.request("GET", "/").status
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+                assert list(executor.map(get_status, range(12))) == [200] * 12
+
     def test_context_combines_with_ca_certs(self) -> None:
         ctx = util.ssl_.create_urllib3_context(
             cert_reqs=ssl.CERT_REQUIRED, ssl_minimum_version=self.tls_version()

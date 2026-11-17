@@ -271,3 +271,206 @@ class TestSSL:
     ) -> None:
         with pytest.raises(SSLError):
             ssl_.assert_fingerprint(b"certificate", fingerprint)
+
+
+def test_shared_context_parallel_connection_setup() -> None:
+    """Configuring a shared context must not race with other TLS handshakes."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    context = mock.create_autospec(ssl_.SSLContext)
+    barrier = Barrier(12)
+
+    def slow_load(*args: object, **kw: object) -> None:
+        time.sleep(0.01)
+
+    context.load_verify_locations.side_effect = slow_load
+
+    def connect() -> None:
+        barrier.wait(timeout=5)
+        ssl_.ssl_wrap_socket(
+            mock.Mock(),
+            ssl_context=context,
+            ca_certs="trust.pem",
+            certfile="client.pem",
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        list(executor.map(lambda _: connect(), range(12)))
+
+    assert context.wrap_socket.call_count == 12
+    assert context.load_verify_locations.call_count == 1
+    assert context.load_cert_chain.call_count == 1
+    assert context.set_alpn_protocols.call_count == 1
+
+
+def test_shared_context_rotation_requires_a_new_context(
+    tmp_path: typing.Any,
+) -> None:
+    """Never silently keep stale CA material when a configured file changes."""
+    ca = tmp_path / "trust.pem"
+    ca.write_bytes(b"CA version one")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs=str(ca))
+    ca.write_bytes(b"CA version two has different length")
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs=str(ca))
+    assert context.wrap_socket.call_count == 1
+
+
+def test_shared_context_ca_directory_replacement_requires_new_context(
+    tmp_path: typing.Any,
+) -> None:
+    ca_dir = tmp_path / "certs"
+    ca_dir.mkdir()
+    (ca_dir / "one.pem").write_bytes(b"one")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    (ca_dir / "two.pem").write_bytes(b"two")
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert context.load_verify_locations.call_count == 1
+    assert context.wrap_socket.call_count == 1
+
+
+def test_shared_context_alpn_policy_change_requires_new_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context)
+    monkeypatch.setattr(ssl_, "ALPN_PROTOCOLS", ["h2", "http/1.1"])
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context)
+    assert context.set_alpn_protocols.call_count == 1
+
+
+def test_shared_context_conflicting_certificates_fail_before_handshake() -> None:
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs="one.pem")
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs="two.pem")
+    assert context.wrap_socket.call_count == 1
+
+
+def test_shared_context_failed_setup_is_retryable() -> None:
+    context = mock.create_autospec(ssl_.SSLContext)
+    context.load_verify_locations.side_effect = [OSError("unreadable CA"), None]
+
+    with pytest.raises(SSLError, match="unreadable CA"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs="ca.pem")
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_certs="ca.pem")
+    assert context.load_verify_locations.call_count == 2
+    assert context.wrap_socket.call_count == 1
+
+
+def test_shared_connection_does_not_rewrite_verification_on_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib3 import connection
+
+    class ObservedContext(ssl.SSLContext):
+        def __new__(cls) -> ObservedContext:
+            return super().__new__(cls, ssl.PROTOCOL_TLS_CLIENT)
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def __setattr__(self, name: str, value: typing.Any) -> None:
+            if name in ("verify_mode", "check_hostname"):
+                self.writes.append(name)
+            super().__setattr__(name, value)
+
+    ctx = ObservedContext()
+    sock = mock.Mock()
+    monkeypatch.setattr(ssl_, "_ssl_wrap_socket_impl", lambda *args: sock)
+    kwargs: dict[str, typing.Any] = dict(
+        sock=mock.Mock(),
+        cert_reqs=ssl.CERT_REQUIRED,
+        ssl_version=None,
+        ssl_minimum_version=None,
+        ssl_maximum_version=None,
+        cert_file=None,
+        key_file=None,
+        key_password=None,
+        ca_certs=None,
+        ca_cert_dir=None,
+        ca_cert_data=None,
+        assert_hostname=False,
+        assert_fingerprint=None,
+        server_hostname="localhost",
+        ssl_context=ctx,
+    )
+    connection._ssl_wrap_socket_and_match_hostname(**kwargs)
+    first_writes = list(ctx.writes)
+    assert first_writes == ["check_hostname"]
+    connection._ssl_wrap_socket_and_match_hostname(**kwargs)
+    assert ctx.writes == first_writes
+
+
+def test_shared_context_does_not_reuse_disabled_hostname_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib3 import connection
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    monkeypatch.setattr(ssl_, "_ssl_wrap_socket_impl", lambda *args: mock.Mock())
+    kwargs: dict[str, typing.Any] = dict(
+        sock=mock.Mock(),
+        cert_reqs=ssl.CERT_REQUIRED,
+        ssl_version=None,
+        ssl_minimum_version=None,
+        ssl_maximum_version=None,
+        cert_file=None,
+        key_file=None,
+        key_password=None,
+        ca_certs=None,
+        ca_cert_dir=None,
+        ca_cert_data=None,
+        assert_hostname=False,
+        assert_fingerprint=None,
+        server_hostname="localhost",
+        ssl_context=context,
+    )
+    connection._ssl_wrap_socket_and_match_hostname(**kwargs)
+    assert context.check_hostname is False
+
+    # This connection expects OpenSSL's built-in hostname verification,
+    # which is now disabled on the shared context by the earlier caller.
+    kwargs["assert_hostname"] = None
+    with pytest.raises(SSLError, match="new SSLContext"):
+        connection._ssl_wrap_socket_and_match_hostname(**kwargs)
+
+
+def test_fresh_context_does_not_use_shared_context_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    monkeypatch.setattr(ssl_, "_ssl_wrap_socket_impl", lambda *args: mock.Mock())
+    monkeypatch.setattr(
+        ssl_,
+        "_configure_shared_ssl_context",
+        lambda *args, **kwargs: pytest.fail("fresh SSLContext used shared lock"),
+    )
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, _context_is_fresh=True)
+
+
+def test_shared_context_ca_dir_detects_inplace_rotation(
+    tmp_path: typing.Any,
+) -> None:
+    ca_dir = tmp_path / "certs"
+    ca_dir.mkdir()
+    cert = ca_dir / "hash.0"
+    cert.write_bytes(b"old cert")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    before = ca_dir.stat().st_mtime_ns
+    cert.write_bytes(b"new certificate data")
+    assert ca_dir.stat().st_mtime_ns == before
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert context.wrap_socket.call_count == 1

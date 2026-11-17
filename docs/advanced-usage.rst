@@ -685,3 +685,18 @@ flag that isn't set by default, and then makes a HTTPS request:
 Note that this is different from passing an ``options`` argument to
 :func:`~urllib3.util.create_urllib3_context` because we don't overwrite
 the default options: we only add a new one.
+
+A supplied SSL context can be shared across threads, but TLS contexts must not
+be modified after they have created SSL sockets. urllib3 therefore configures
+a supplied context once, before making its first connection, and does not
+reload certificate files or alter its TLS configuration on subsequent connections.
+If you pass certificate paths such as ``ca_certs``, ``cert_file``, or ``key_file``
+alongside a custom ``ssl_context``, urllib3 loads them on the first connection.
+
+When you replace a CA bundle, rotate a client certificate, or change TLS
+configuration, create a **new** :class:`ssl.SSLContext <python:ssl.SSLContext>`
+and connection pool instead of mutating an active context. urllib3 checks
+certificate-file metadata when reusing a configured context and raises
+:class:`~urllib3.exceptions.SSLError` if it detects a changed configuration.
+Caller-driven changes to a context made by other code cannot be coordinated by
+urllib3, so finish configuring custom contexts before sharing them.

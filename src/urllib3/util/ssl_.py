@@ -4,9 +4,12 @@ import hashlib
 import hmac
 import os
 import socket
+import stat
 import sys
+import threading
 import typing
 import warnings
+import weakref
 from binascii import Error as BinasciiError
 from binascii import unhexlify
 
@@ -18,6 +21,14 @@ SSLTransport = None
 HAS_NEVER_CHECK_COMMON_NAME = False
 IS_PYOPENSSL = False
 ALPN_PROTOCOLS = ["http/1.1"]
+
+# Only the first connection may configure a caller-provided SSLContext. OpenSSL
+# doesn't allow changing an SSL_CTX after creating SSL objects from it, and
+# multiple pool connections can be opened concurrently.
+_SHARED_CONTEXT_LOCK = threading.Lock()
+_SHARED_CONTEXT_CONFIGS: weakref.WeakKeyDictionary[
+    typing.Any, tuple[typing.Any, ...]
+] = weakref.WeakKeyDictionary()
 
 _TYPE_VERSION_INFO = tuple[int, int, int, str, int]
 
@@ -328,6 +339,134 @@ def create_urllib3_context(
     return context
 
 
+def _ssl_material_revision(path: str | None) -> typing.Any:
+    """Record file or directory identity and metadata for rotation detection."""
+    if path is None:
+        return None
+    try:
+        item = os.stat(path)
+    except OSError as error:
+        return ("unavailable", error.errno)
+    revision = (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+    if not stat.S_ISDIR(item.st_mode):
+        return revision
+    # Existing capath entries can be edited in place, or symlink targets
+    # replaced, without modifying the parent directory's mtime. Observe each
+    # entry rather than accidentally pinning an old trust store forever.
+    try:
+        with os.scandir(path) as entries:
+            children = []
+            for entry in entries:
+                try:
+                    child = entry.stat()  # Follow capath's hashed symlinks.
+                    child_revision: tuple[typing.Any, ...] = (
+                        child.st_dev,
+                        child.st_ino,
+                        child.st_size,
+                        child.st_mtime_ns,
+                    )
+                except OSError as error:
+                    child_revision = ("unavailable", error.errno)
+                children.append((entry.name, child_revision))
+    except OSError as error:
+        return (revision, "unavailable", error.errno)
+    return (revision, tuple(sorted(children)))
+
+
+def _configure_shared_ssl_context(
+    context: ssl.SSLContext,
+    *,
+    verify_mode: VerifyMode | None,
+    disable_hostname_check: bool,
+    ca_certs: str | None,
+    ca_cert_dir: str | None,
+    ca_cert_data: None | str | bytes,
+    certfile: str | None,
+    keyfile: str | None,
+    key_password: str | None,
+) -> None:
+    """Prepare a supplied context exactly once, before any urllib3 TLS objects.
+
+    Certificate fingerprints are checked on every reuse. A changed trust
+    bundle or conflicting settings cannot be reloaded into an in-use context;
+    require a fresh context instead of silently keeping stale CA material.
+    """
+    with _SHARED_CONTEXT_LOCK:
+        requested_verify_mode: int = (
+            context.verify_mode if verify_mode is None else verify_mode
+        )
+        requested_check_hostname = (
+            False
+            if disable_hostname_check
+            else getattr(context, "check_hostname", False)
+        )
+        parameters = (
+            requested_verify_mode,
+            requested_check_hostname,
+            # Once we disable built-in hostname verification for manual
+            # checking, a later caller must not silently inherit that policy.
+            disable_hostname_check,
+            ca_certs,
+            ca_cert_dir,
+            ca_cert_data,
+            certfile,
+            keyfile,
+            key_password,
+            tuple(ALPN_PROTOCOLS),
+        )
+        versions = (
+            _ssl_material_revision(ca_certs),
+            _ssl_material_revision(ca_cert_dir),
+            _ssl_material_revision(certfile),
+            _ssl_material_revision(keyfile),
+        )
+        desired = (parameters, versions)
+        prior = _SHARED_CONTEXT_CONFIGS.get(context)
+        if prior is not None:
+            if (
+                prior != desired
+                or context.verify_mode != requested_verify_mode
+                or getattr(context, "check_hostname", False) != requested_check_hostname
+            ):
+                raise SSLError(
+                    "TLS settings or certificate material changed on an in-use "
+                    "SSLContext; create a new SSLContext and connection pool."
+                )
+            return
+
+        # check_hostname must be disabled before CERT_NONE can be selected.
+        if disable_hostname_check and getattr(context, "check_hostname", False):
+            context.check_hostname = False
+        if verify_mode is not None and context.verify_mode != verify_mode:
+            context.verify_mode = verify_mode
+
+        if ca_certs or ca_cert_dir or ca_cert_data:
+            try:
+                context.load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)
+            except OSError as error:
+                raise SSLError(error) from error
+
+        if keyfile and key_password is None and _is_key_file_encrypted(keyfile):
+            raise SSLError("Client private key is encrypted, password is required")
+        if certfile:
+            if key_password is None:
+                context.load_cert_chain(certfile, keyfile)
+            else:
+                context.load_cert_chain(certfile, keyfile, key_password)
+
+        context.set_alpn_protocols(ALPN_PROTOCOLS)
+        if versions != (
+            _ssl_material_revision(ca_certs),
+            _ssl_material_revision(ca_cert_dir),
+            _ssl_material_revision(certfile),
+            _ssl_material_revision(keyfile),
+        ):
+            raise SSLError(
+                "Certificate material changed during TLS setup; create a new SSLContext."
+            )
+        _SHARED_CONTEXT_CONFIGS[context] = desired
+
+
 @typing.overload
 def ssl_wrap_socket(
     sock: socket.socket,
@@ -343,6 +482,9 @@ def ssl_wrap_socket(
     key_password: str | None = ...,
     ca_cert_data: None | str | bytes = ...,
     tls_in_tls: typing.Literal[False] = ...,
+    _context_verify_mode: VerifyMode | None = ...,
+    _context_disable_hostname_check: bool = ...,
+    _context_is_fresh: bool = ...,
 ) -> ssl.SSLSocket: ...
 
 
@@ -361,6 +503,9 @@ def ssl_wrap_socket(
     key_password: str | None = ...,
     ca_cert_data: None | str | bytes = ...,
     tls_in_tls: bool = ...,
+    _context_verify_mode: VerifyMode | None = ...,
+    _context_disable_hostname_check: bool = ...,
+    _context_is_fresh: bool = ...,
 ) -> ssl.SSLSocket | SSLTransportType: ...
 
 
@@ -378,6 +523,9 @@ def ssl_wrap_socket(
     key_password: str | None = None,
     ca_cert_data: None | str | bytes = None,
     tls_in_tls: bool = False,
+    _context_verify_mode: VerifyMode | None = None,
+    _context_disable_hostname_check: bool = False,
+    _context_is_fresh: bool = False,
 ) -> ssl.SSLSocket | SSLTransportType:
     """
     All arguments except for server_hostname, ssl_context, tls_in_tls, ca_cert_data and
@@ -405,34 +553,38 @@ def ssl_wrap_socket(
         Use SSLTransport to wrap the existing socket.
     """
     context = ssl_context
-    if context is None:
-        # Note: This branch of code and all the variables in it are only used in tests.
-        # We should consider deprecating and removing this code.
-        context = create_urllib3_context(ssl_version, cert_reqs, ciphers=ciphers)
-
-    if ca_certs or ca_cert_dir or ca_cert_data:
-        try:
-            context.load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)
-        except OSError as e:
-            raise SSLError(e) from e
-
-    elif ssl_context is None and hasattr(context, "load_default_certs"):
-        # try to load OS default certs; works well on Windows.
-        context.load_default_certs()
-
-    # Attempt to detect if we get the goofy behavior of the
-    # keyfile being encrypted and OpenSSL asking for the
-    # passphrase via the terminal and instead error out.
-    if keyfile and key_password is None and _is_key_file_encrypted(keyfile):
-        raise SSLError("Client private key is encrypted, password is required")
-
-    if certfile:
-        if key_password is None:
-            context.load_cert_chain(certfile, keyfile)
-        else:
-            context.load_cert_chain(certfile, keyfile, key_password)
-
-    context.set_alpn_protocols(ALPN_PROTOCOLS)
+    if context is None or _context_is_fresh:
+        # A fresh context belongs to this socket; don't serialize unrelated
+        # connections behind the global lock for caller-shared contexts.
+        if context is None:
+            context = create_urllib3_context(ssl_version, cert_reqs, ciphers=ciphers)
+        if ca_certs or ca_cert_dir or ca_cert_data:
+            try:
+                context.load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)
+            except OSError as e:
+                raise SSLError(e) from e
+        elif hasattr(context, "load_default_certs"):
+            context.load_default_certs()
+        if keyfile and key_password is None and _is_key_file_encrypted(keyfile):
+            raise SSLError("Client private key is encrypted, password is required")
+        if certfile:
+            if key_password is None:
+                context.load_cert_chain(certfile, keyfile)
+            else:
+                context.load_cert_chain(certfile, keyfile, key_password)
+        context.set_alpn_protocols(ALPN_PROTOCOLS)
+    else:
+        _configure_shared_ssl_context(
+            context,
+            verify_mode=_context_verify_mode,
+            disable_hostname_check=_context_disable_hostname_check,
+            ca_certs=ca_certs,
+            ca_cert_dir=ca_cert_dir,
+            ca_cert_data=ca_cert_data,
+            certfile=certfile,
+            keyfile=keyfile,
+            key_password=key_password,
+        )
 
     ssl_sock = _ssl_wrap_socket_impl(sock, context, tls_in_tls, server_hostname)
     return ssl_sock

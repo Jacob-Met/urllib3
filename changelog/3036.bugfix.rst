@@ -1,0 +1,4 @@
+Configured caller-supplied SSL contexts once before connection creation to
+prevent concurrent mutations and repeated certificate loading. Reusing a
+context after its TLS configuration or certificate files changed now raises
+an error; create a new context and pool for certificate rotation.

@@ -1065,10 +1065,8 @@ def _ssl_wrap_socket_and_match_hostname(
     else:
         context = ssl_context
 
-    context.verify_mode = resolve_cert_reqs(cert_reqs)
-
     # In some cases, we want to verify hostnames ourselves
-    if (
+    disable_hostname_check = (
         # `ssl` can't verify fingerprints or alternate hostnames
         assert_fingerprint
         or assert_hostname
@@ -1078,8 +1076,11 @@ def _ssl_wrap_socket_and_match_hostname(
         # hostnames easily: https://github.com/pyca/pyopenssl/pull/933
         or ssl_.IS_PYOPENSSL
         or not ssl_.HAS_NEVER_CHECK_COMMON_NAME
-    ):
-        context.check_hostname = False
+    )
+    if default_ssl_context:
+        context.verify_mode = resolve_cert_reqs(cert_reqs)
+        if disable_hostname_check:
+            context.check_hostname = False
 
     # Try to load OS default certs if none are given. We need to do the hasattr() check
     # for custom pyOpenSSL SSLContext objects because they don't support
@@ -1114,6 +1115,12 @@ def _ssl_wrap_socket_and_match_hostname(
         server_hostname=server_hostname,
         ssl_context=context,
         tls_in_tls=tls_in_tls,
+        _context_verify_mode=(
+            resolve_cert_reqs(cert_reqs) if not default_ssl_context else None
+        ),
+        _context_disable_hostname_check=disable_hostname_check
+        and not default_ssl_context,
+        _context_is_fresh=default_ssl_context,
     )
 
     try:
