@@ -505,3 +505,137 @@ def test_shared_context_ca_dir_detects_inplace_rotation(
     with pytest.raises(SSLError, match="new SSLContext"):
         ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
     assert context.wrap_socket.call_count == 1
+
+
+def test_shared_capath_does_not_rescan_every_wrap(
+    tmp_path: typing.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ca_dir = tmp_path / "large-capath"
+    ca_dir.mkdir()
+    for i in range(200):
+        (ca_dir / f"{i:08x}.0").write_bytes(b"test certificate")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    watcher = ssl_._SHARED_CONTEXT_CONFIGS[context][2]
+    if watcher.fd is None:
+        pytest.skip("native directory change notifications unavailable")
+    # A slow CI scheduler must not make an otherwise stable hot-path
+    # no-rescan assertion dependent on 100 ms of wall-clock time.
+    monkeypatch.setattr(ssl_._CAPathWatcher, "_RESCAN_SECONDS", 3600)
+    revisions = 0
+    original = ssl_._ssl_material_revision
+
+    def count_revision(path: str | None) -> typing.Any:
+        nonlocal revisions
+        if path == str(ca_dir):
+            revisions += 1
+        return original(path)
+
+    monkeypatch.setattr(ssl_, "_ssl_material_revision", count_revision)
+    for _ in range(30):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert revisions == 0
+    assert context.load_verify_locations.call_count == 1
+
+
+def test_shared_capath_detects_external_symlink_target_rotation(
+    tmp_path: typing.Any,
+) -> None:
+    ca_dir = tmp_path / "capath"
+    ca_dir.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    cert = external / "trusted.pem"
+    cert.write_bytes(b"old CA material")
+    (ca_dir / "12345678.0").symlink_to(cert)
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    cert.write_bytes(b"new CA material, updated")
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert context.wrap_socket.call_count == 1
+
+
+def test_shared_capath_detects_metadata_preserving_rewrite(
+    tmp_path: typing.Any,
+) -> None:
+    import os
+
+    ca_dir = tmp_path / "capath"
+    ca_dir.mkdir()
+    cert = ca_dir / "trusted.pem"
+    cert.write_bytes(b"version1")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    watcher = ssl_._SHARED_CONTEXT_CONFIGS[context][2]
+    if watcher.fd is None:
+        pytest.skip("native directory change notifications unavailable")
+    old = cert.stat()
+    cert.write_bytes(b"version2")
+    os.utime(cert, ns=(old.st_atime_ns, old.st_mtime_ns))
+    assert cert.stat().st_size == old.st_size
+    assert cert.stat().st_mtime_ns == old.st_mtime_ns
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+
+
+def test_shared_capath_unavailable_notification_falls_back_to_scan(
+    tmp_path: typing.Any,
+) -> None:
+    ca_dir = tmp_path / "capath"
+    ca_dir.mkdir()
+    cert = ca_dir / "trusted.pem"
+    cert.write_bytes(b"version1")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    watcher = ssl_._SHARED_CONTEXT_CONFIGS[context][2]
+    watcher._disable()
+    cert.write_bytes(b"version two is longer")
+
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert context.load_verify_locations.call_count == 1
+
+
+def test_shared_capath_new_symlink_targets_rearm_watches(
+    tmp_path: typing.Any,
+) -> None:
+    ca_dir = tmp_path / "capath"
+    ca_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = ca_dir / "old.pem"
+    original.write_bytes(b"old")
+    previous = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=previous, ca_cert_dir=str(ca_dir))
+    target = outside / "new-trust.pem"
+    target.write_bytes(b"trusted")
+    (ca_dir / "new.0").symlink_to(target)
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=previous, ca_cert_dir=str(ca_dir))
+
+    fresh = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=fresh, ca_cert_dir=str(ca_dir))
+    target.write_bytes(b"now untrusted")
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=fresh, ca_cert_dir=str(ca_dir))
+
+
+def test_shared_capath_detects_fork_and_falls_back(
+    tmp_path: typing.Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    ca_dir = tmp_path / "capath"
+    ca_dir.mkdir()
+    cert = ca_dir / "trusted.pem"
+    cert.write_bytes(b"version1")
+    context = mock.create_autospec(ssl_.SSLContext)
+    ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    original_pid = os.getpid()
+    monkeypatch.setattr(ssl_.os, "getpid", lambda: original_pid + 1)
+    cert.write_bytes(b"version2 with more bytes")
+    with pytest.raises(SSLError, match="new SSLContext"):
+        ssl_.ssl_wrap_socket(mock.Mock(), ssl_context=context, ca_cert_dir=str(ca_dir))
+    assert ssl_._SHARED_CONTEXT_CONFIGS[context][2].fd is None

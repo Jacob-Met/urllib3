@@ -5,8 +5,10 @@ import hmac
 import os
 import socket
 import stat
+import struct
 import sys
 import threading
+import time
 import typing
 import warnings
 import weakref
@@ -29,6 +31,12 @@ _SHARED_CONTEXT_LOCK = threading.Lock()
 _SHARED_CONTEXT_CONFIGS: weakref.WeakKeyDictionary[
     typing.Any, tuple[typing.Any, ...]
 ] = weakref.WeakKeyDictionary()
+# Directory metadata scans require one stat syscall per certificate. On Linux
+# listen for mutations, with bounded rescans for missed/coalesced notifications;
+# on other platforms retain the immediate metadata scan.
+_CAPATH_WATCHERS: weakref.WeakValueDictionary[str, _CAPathWatcher] = (
+    weakref.WeakValueDictionary()
+)
 
 _TYPE_VERSION_INFO = tuple[int, int, int, str, int]
 
@@ -373,6 +381,149 @@ def _ssl_material_revision(path: str | None) -> typing.Any:
     return (revision, tuple(sorted(children)))
 
 
+class _CAPathWatcher:
+    """Amortize CApath revisions without indefinitely caching trust material.
+
+    Linux inotify watches the directory and any directories containing targets
+    of symlinked certificates. Missed notifications and unsupported platforms
+    fall back to metadata scanning; this never reloads a live SSLContext.
+    """
+
+    __slots__ = (
+        "path",
+        "revision",
+        "last_scan",
+        "generation",
+        "pid",
+        "fd",
+        "__weakref__",
+    )
+    # Bound missed-event staleness to 100 ms without a scan per connection.
+    _RESCAN_SECONDS = 0.1
+    _MUTATIONS = (
+        0x00000002  # IN_MODIFY
+        | 0x00000004  # IN_ATTRIB
+        | 0x00000008  # IN_CLOSE_WRITE
+        | 0x00000100  # IN_CREATE
+        | 0x00000200  # IN_DELETE
+        | 0x00000400  # IN_DELETE_SELF
+        | 0x00000800  # IN_MOVE_SELF
+        | 0x00000040  # IN_MOVED_FROM
+        | 0x00000080  # IN_MOVED_TO
+    )
+    _INVALIDATED = 0x00008000 | 0x00004000 | 0x00000400 | 0x00000800
+    _WATCH_LAYOUT_CHANGED = (
+        _INVALIDATED | 0x00000100 | 0x00000200 | 0x00000040 | 0x00000080
+    )
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.revision = _ssl_material_revision(path)
+        self.last_scan = time.monotonic()
+        self.generation = 0
+        self.pid = os.getpid()
+        self.fd: int | None = None
+        if sys.platform != "linux" or not os.path.isdir(path):
+            return
+        fd = -1
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            init = libc.inotify_init1
+            init.argtypes = [ctypes.c_int]
+            init.restype = ctypes.c_int
+            fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+            if fd < 0:
+                return
+            add_watch = libc.inotify_add_watch
+            add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            add_watch.restype = ctypes.c_int
+            directories = {path}
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.is_symlink():
+                        directories.add(os.path.dirname(os.path.realpath(entry.path)))
+            for directory in directories:
+                if add_watch(fd, os.fsencode(directory), self._MUTATIONS) < 0:
+                    raise OSError(
+                        ctypes.get_errno(), "CApath watch could not be installed"
+                    )
+            self.fd = fd
+            # Watch before the authoritative snapshot: mutations between
+            # installation and trust load are observable by the next read.
+            self.revision = _ssl_material_revision(path)
+            self.last_scan = time.monotonic()
+        except (OSError, AttributeError, ImportError):
+            if fd >= 0:
+                os.close(fd)
+
+    def _disable(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def current_revision(self) -> typing.Any:
+        changed = False
+        invalidated = False
+        if os.getpid() != self.pid:
+            # Forked processes share the same inotify queue. Reading it in
+            # the child could consume the parent's rotation notification.
+            self._disable()
+            self.pid = os.getpid()
+            invalidated = True
+        if self.fd is not None:
+            try:
+                while True:
+                    try:
+                        events = os.read(self.fd, 65536)
+                    except BlockingIOError:
+                        break
+                    if not events:
+                        self._disable()
+                        break
+                    changed = True
+                    offset = 0
+                    while offset + 16 <= len(events):
+                        _, mask, _, name_length = struct.unpack_from(
+                            "iIII", events, offset
+                        )
+                        if mask & self._WATCH_LAYOUT_CHANGED:
+                            invalidated = True
+                        offset += 16 + name_length
+            except OSError:
+                invalidated = True
+        if invalidated:
+            # New symlink targets need new watches. Keep this monitor alive
+            # for earlier contexts (which must fail closed) but do not give
+            # it to newly created contexts after directory layout changes.
+            self._disable()
+            if _CAPATH_WATCHERS.get(self.path) is self:
+                del _CAPATH_WATCHERS[self.path]
+        if changed:
+            # Even a metadata-preserving rewrite must invalidate existing
+            # contexts. Track events independently of size/mtime snapshots.
+            self.generation += 1
+        now = time.monotonic()
+        if self.fd is None or changed or now - self.last_scan >= self._RESCAN_SECONDS:
+            self.revision = _ssl_material_revision(self.path)
+            self.last_scan = now
+        return self.generation, self.revision
+
+    def __del__(self) -> None:
+        if self.fd is not None:
+            self._disable()
+
+
+def _ca_path_watcher(path: str) -> _CAPathWatcher:
+    path = os.path.abspath(path)
+    watcher = _CAPATH_WATCHERS.get(path)
+    if watcher is None:
+        watcher = _CAPathWatcher(path)
+        _CAPATH_WATCHERS[path] = watcher
+    return watcher
+
+
 def _configure_shared_ssl_context(
     context: ssl.SSLContext,
     *,
@@ -414,17 +565,26 @@ def _configure_shared_ssl_context(
             key_password,
             tuple(ALPN_PROTOCOLS),
         )
+        prior = _SHARED_CONTEXT_CONFIGS.get(context)
+        watcher = (
+            prior[2]
+            if prior is not None
+            else _ca_path_watcher(ca_cert_dir) if ca_cert_dir is not None else None
+        )
         versions = (
             _ssl_material_revision(ca_certs),
-            _ssl_material_revision(ca_cert_dir),
+            (
+                watcher.current_revision()
+                if watcher
+                else _ssl_material_revision(ca_cert_dir)
+            ),
             _ssl_material_revision(certfile),
             _ssl_material_revision(keyfile),
         )
         desired = (parameters, versions)
-        prior = _SHARED_CONTEXT_CONFIGS.get(context)
         if prior is not None:
             if (
-                prior != desired
+                prior[:2] != desired
                 or context.verify_mode != requested_verify_mode
                 or getattr(context, "check_hostname", False) != requested_check_hostname
             ):
@@ -457,14 +617,18 @@ def _configure_shared_ssl_context(
         context.set_alpn_protocols(ALPN_PROTOCOLS)
         if versions != (
             _ssl_material_revision(ca_certs),
-            _ssl_material_revision(ca_cert_dir),
+            (
+                watcher.current_revision()
+                if watcher
+                else _ssl_material_revision(ca_cert_dir)
+            ),
             _ssl_material_revision(certfile),
             _ssl_material_revision(keyfile),
         ):
             raise SSLError(
                 "Certificate material changed during TLS setup; create a new SSLContext."
             )
-        _SHARED_CONTEXT_CONFIGS[context] = desired
+        _SHARED_CONTEXT_CONFIGS[context] = (parameters, versions, watcher)
 
 
 @typing.overload

@@ -699,4 +699,8 @@ and connection pool instead of mutating an active context. urllib3 checks
 certificate-file metadata when reusing a configured context and raises
 :class:`~urllib3.exceptions.SSLError` if it detects a changed configuration.
 Caller-driven changes to a context made by other code cannot be coordinated by
-urllib3, so finish configuring custom contexts before sharing them.
+urllib3, so finish configuring custom contexts before sharing them. For a CA
+directory, Linux uses filesystem change notifications and occasional metadata
+rescans to avoid scanning every certificate on each connection; where change
+notifications are unavailable, urllib3 checks metadata on each reuse. Detection
+is best effort, so explicitly replace contexts when rotating trust material.
