@@ -4,6 +4,7 @@ import io
 import sys
 import typing
 from base64 import b64encode
+from collections.abc import Iterator
 from enum import Enum
 
 from ..exceptions import UnrewindableBodyError
@@ -173,6 +174,11 @@ def make_headers(
     return headers
 
 
+def _is_non_replayable_iterator(body: typing.Any) -> bool:
+    """Return whether the request body is a one-shot iterator without a position."""
+    return isinstance(body, Iterator) and getattr(body, "tell", None) is None
+
+
 def set_file_position(
     body: typing.Any, pos: _TYPE_BODY_POSITION | None
 ) -> _TYPE_BODY_POSITION | None:
@@ -189,6 +195,10 @@ def set_file_position(
             # This differentiates from None, allowing us to catch
             # a failed `tell()` later when trying to rewind the body.
             pos = _FAILEDTELL
+    elif _is_non_replayable_iterator(body):
+        # Iterators (generators, map, iter(list), etc.) cannot be restarted.
+        # Refuse a retry rather than silently sending an empty request body.
+        pos = _FAILEDTELL
 
     return pos
 

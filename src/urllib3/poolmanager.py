@@ -21,11 +21,13 @@ from .exceptions import (
     LocationValueError,
     MaxRetryError,
     ProxySchemeUnknown,
+    UnrewindableBodyError,
     URLSchemeUnknown,
 )
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
+from .util.request import _is_non_replayable_iterator
 from .util.retry import Retry
 from .util.timeout import Timeout
 from .util.url import Url, parse_url
@@ -519,6 +521,16 @@ class PoolManager(RequestMethods):
                 response.drain_conn()
                 raise
             return response
+
+        # The inner pool cannot remember a body position across redirects
+        # handled here (including cross-host redirects). Do not resend an
+        # already-consumed one-shot iterator as an apparently successful
+        # empty upload.
+        if response.status != 303 and _is_non_replayable_iterator(kw.get("body")):
+            response.drain_conn()
+            raise UnrewindableBodyError(
+                "Unable to rewind a one-shot iterator request body for redirect."
+            )
 
         kw["retries"] = retries
         kw["redirect"] = redirect
