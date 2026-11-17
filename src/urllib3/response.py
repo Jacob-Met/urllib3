@@ -528,6 +528,9 @@ class BaseHTTPResponse(io.IOBase):
             self.chunked = True
 
         self._decoder: ContentDecoder | None = None
+        # A bounded EOF read may need several calls to drain the decoder
+        # before its final flush can safely run.
+        self._decoder_flushed = False
         # Distinguish an uninitialized decoder from a response needing no decoder.
         self._decoder_initialized = False
         self.length_remaining: int | None
@@ -673,12 +676,13 @@ class BaseHTTPResponse(io.IOBase):
                 )
             return data
 
-        if max_length is None or flush_decoder:
+        if max_length is None:
             max_length = -1
 
         try:
             if self._decoder:
-                data = self._decoder.decompress(data, max_length=max_length)
+                if not self._decoder_flushed:
+                    data = self._decoder.decompress(data, max_length=max_length)
                 self._has_decoded_content = True
         except self.DECODER_ERROR_CLASSES as e:
             content_encoding = self.headers.get("content-encoding", "").lower()
@@ -687,19 +691,29 @@ class BaseHTTPResponse(io.IOBase):
                 "failed to decode it." % content_encoding,
                 e,
             ) from e
-        if flush_decoder:
-            data += self._flush_decoder()
+        if flush_decoder and (max_length < 0 or len(data) < max_length):
+            remaining = max_length - len(data) if max_length > 0 else -1
+            data += self._flush_decoder(remaining)
 
         return data
 
-    def _flush_decoder(self) -> bytes:
+    def _flush_decoder(self, max_length: int = -1) -> bytes:
         """
-        Flushes the decoder. Should only be called if the decoder is actually
-        being used.
+        Drain pending decoder output before running the final flush.
+        A bounded read must not turn into an unlimited decode at EOF.
         """
-        if self._decoder:
-            return self._decoder.decompress(b"") + self._decoder.flush()
-        return b""
+        if not self._decoder or self._decoder_flushed:
+            return b""
+
+        data = self._decoder.decompress(b"", max_length=max_length)
+        if max_length > 0 and (
+            len(data) >= max_length or self._decoder.has_unconsumed_tail
+        ):
+            return data
+
+        data += self._decoder.flush()
+        self._decoder_flushed = True
+        return data
 
     # Compatibility methods for `io` module
     def readinto(self, b: bytearray | memoryview[int]) -> int:
@@ -1499,11 +1513,12 @@ class HTTPResponse(BaseHTTPResponse):
                     yield decoded
 
             if decode_content:
-                # On CPython and PyPy, we should never need to flush the
-                # decoder. However, on Jython we *might* need to, so
-                # lets defensively do it anyway.
-                decoded = self._flush_decoder()
-                if decoded:  # Platform-specific: Jython.
+                # A decoder can retain output even when it has no unconsumed
+                # compressed input. Drain EOF output with the caller's limit.
+                while not self._decoder_flushed and self._decoder:
+                    decoded = self._flush_decoder(amt if amt is not None else -1)
+                    if not decoded:
+                        break
                     yield decoded
 
             # Chunk content ends with \r\n: discard it.

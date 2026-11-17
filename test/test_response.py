@@ -1034,6 +1034,51 @@ class TestResponse:
         assert r._decoder is None
         assert len(r._decoded_buffer) == 0
 
+    @onlyBrotli()
+    @pytest.mark.parametrize("read_method", ("read", "read1", "stream", "read_chunked"))
+    def test_brotli_eof_flush_respects_bounded_reads(self, read_method: str) -> None:
+        if not _brotli_gte_1_2_0_available:
+            pytest.skip("Brotli 1.2.0 or newer is required")
+
+        original = b"A" * (8 * 1024 * 1024)
+        compressed = brotli.compress(original)
+        if read_method in ("stream", "read_chunked"):
+            raw = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+            raw.fp = MockChunkedEncodingResponse([compressed])  # type: ignore[assignment]
+            response = HTTPResponse(
+                raw,
+                preload_content=False,
+                headers={"transfer-encoding": "chunked", "content-encoding": "br"},
+            )
+            parts = getattr(response, read_method)(amt=1024, decode_content=True)
+        else:
+            response = HTTPResponse(
+                BytesIO(compressed),
+                preload_content=False,
+                headers={"content-encoding": "br"},
+            )
+            read = getattr(response, read_method)
+
+            def parts_iter() -> typing.Iterator[bytes]:
+                while part := read(1024, decode_content=True):
+                    yield part
+
+            parts = parts_iter()
+
+        decoded = bytearray()
+        peak_buffer = 0
+        max_chunk = 0
+        for part in parts:
+            decoded.extend(part)
+            peak_buffer = max(peak_buffer, len(response._decoded_buffer))
+            max_chunk = max(max_chunk, len(part))
+
+        assert decoded == original
+        # Google Brotli may overshoot output_buffer_limit by ~32 KiB.
+        # It must not decode multiple MiB in an unlimited EOF flush.
+        assert peak_buffer < 128 * 1024
+        assert max_chunk < 128 * 1024
+
     def test_multi_decoding_deflate_deflate(self) -> None:
         data = zlib.compress(zlib.compress(b"foo"))
 
