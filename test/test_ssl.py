@@ -445,6 +445,37 @@ def test_shared_context_does_not_reuse_disabled_hostname_verification(
         connection._ssl_wrap_socket_and_match_hostname(**kwargs)
 
 
+def test_default_connection_loads_system_trust_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The high-level caller already loads OS CAs into a fresh context."""
+    from urllib3 import connection
+
+    context = mock.create_autospec(ssl_.SSLContext)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    monkeypatch.setattr(connection, "create_urllib3_context", lambda *a, **k: context)
+    monkeypatch.setattr(ssl_, "_ssl_wrap_socket_impl", lambda *args: mock.Mock())
+    connection._ssl_wrap_socket_and_match_hostname(
+        sock=mock.Mock(),
+        cert_reqs=ssl.CERT_REQUIRED,
+        ssl_version=None,
+        ssl_minimum_version=None,
+        ssl_maximum_version=None,
+        cert_file=None,
+        key_file=None,
+        key_password=None,
+        ca_certs=None,
+        ca_cert_dir=None,
+        ca_cert_data=None,
+        assert_hostname=None,
+        assert_fingerprint=None,
+        server_hostname="localhost",
+        ssl_context=None,
+    )
+    assert context.load_default_certs.call_count == 1
+
+
 def test_fresh_context_does_not_use_shared_context_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

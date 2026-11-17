@@ -563,7 +563,9 @@ def ssl_wrap_socket(
                 context.load_verify_locations(ca_certs, ca_cert_dir, ca_cert_data)
             except OSError as e:
                 raise SSLError(e) from e
-        elif hasattr(context, "load_default_certs"):
+        elif not _context_is_fresh and hasattr(context, "load_default_certs"):
+            # The high-level connection caller has already loaded the OS CA
+            # store into its freshly created context before passing it here.
             context.load_default_certs()
         if keyfile and key_password is None and _is_key_file_encrypted(keyfile):
             raise SSLError("Client private key is encrypted, password is required")
