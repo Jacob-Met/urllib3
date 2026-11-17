@@ -3,8 +3,8 @@ from __future__ import annotations
 from importlib.metadata import version
 
 __all__ = [
-    "inject_into_urllib3",
     "extract_from_urllib3",
+    "inject_into_urllib3",
 ]
 
 import typing
@@ -26,13 +26,16 @@ def inject_into_urllib3() -> None:
     from .. import connection as urllib3_connection
     from .. import util as urllib3_util
     from ..connectionpool import HTTPSConnectionPool
+    from ..poolmanager import pool_classes_by_scheme
     from ..util import ssl_ as urllib3_util_ssl
     from .connection import HTTP2Connection
+    from .multiplex import HTTP2MultiplexConnectionPool
 
     global orig_HTTPSConnection
     orig_HTTPSConnection = urllib3_connection.HTTPSConnection
 
     HTTPSConnectionPool.ConnectionCls = HTTP2Connection
+    pool_classes_by_scheme["https"] = HTTP2MultiplexConnectionPool
     urllib3_connection.HTTPSConnection = HTTP2Connection  # type: ignore[misc]
 
     # TODO: Offer 'http/1.1' as well, but for testing purposes this is handy.
@@ -44,9 +47,11 @@ def extract_from_urllib3() -> None:
     from .. import connection as urllib3_connection
     from .. import util as urllib3_util
     from ..connectionpool import HTTPSConnectionPool
+    from ..poolmanager import pool_classes_by_scheme
     from ..util import ssl_ as urllib3_util_ssl
 
     HTTPSConnectionPool.ConnectionCls = orig_HTTPSConnection
+    pool_classes_by_scheme["https"] = HTTPSConnectionPool
     urllib3_connection.HTTPSConnection = orig_HTTPSConnection  # type: ignore[misc]
 
     urllib3_util.ALPN_PROTOCOLS = ["http/1.1"]

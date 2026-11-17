@@ -56,6 +56,42 @@ Any new requests will block until a connection is available from the pool.
 This is a great way to prevent flooding a host with too many connections in
 multi-threaded applications.
 
+Experimental HTTP/2 multiplexing
+--------------------------------
+
+When the optional ``h2`` 4.x package is installed, the experimental HTTP/2
+integration can be enabled in a process to let concurrent requests to the same
+host share one TLS connection instead of opening one connection per request.
+It is experimental and changes HTTPS connection behavior globally for the
+current process; enable it before creating a :class:`~poolmanager.PoolManager`
+and restore the default integration when finished:
+
+.. code-block:: python
+
+    import urllib3
+    from urllib3.http2 import inject_into_urllib3, extract_from_urllib3
+
+    inject_into_urllib3()
+    try:
+        http = urllib3.PoolManager(maxsize=1, block=True)
+        try:
+            response = http.request("GET", "https://example.com/")
+            print(response.status, response.data)
+        finally:
+            http.clear()
+    finally:
+        extract_from_urllib3()
+
+The HTTP/2 transport manages peer stream limits and response-body flow control
+per stream. Streaming responses should be fully read or explicitly closed;
+closing a response retires only that stream. A graceful ``GOAWAY`` allows
+already accepted streams to drain while later requests use a new TLS session.
+
+This opt-in mode requires a server offering HTTP/2 over TLS and does not
+provide HTTP/1.1 fallback or tunneling through proxies. It is not suitable for
+applications that must dynamically change protocol support in different
+threads of the same process.
+
 .. _stream:
 .. _streaming_and_io:
 

@@ -1,0 +1,1 @@
+Added experimental HTTP/2 multiplexing to ``urllib3.http2.inject_into_urllib3()``. Concurrent requests to a host can now share one TLS connection with independent response streaming, flow control, cancellation, and graceful session rotation after a peer ``GOAWAY``.
